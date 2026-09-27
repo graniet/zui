@@ -1,6 +1,15 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
+    // A Windows build made on another OS has no fxc: its release shaders are
+    // compiled at startup from the embedded HLSL (D3DCompile) instead.
+    println!("cargo:rustc-check-cfg=cfg(gpui_runtime_shaders)");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && !cfg!(target_os = "windows")
+    {
+        println!("cargo:rustc-cfg=gpui_runtime_shaders");
+    }
+
     #[cfg(target_os = "windows")]
     {
         // Compile HLSL shaders

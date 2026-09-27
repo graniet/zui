@@ -104,7 +104,7 @@ impl WindowsWindowInner {
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
-            WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
+            WM_SETCURSOR => self.handle_set_cursor(handle, wparam, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
@@ -421,6 +421,13 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> Option<isize> {
         unsafe { SetCapture(handle) };
+        // A click on GPUI takes the keyboard back from a native child (a web
+        // view keeps focus otherwise).
+        unsafe {
+            if GetFocus() != handle {
+                let _ = SetFocus(Some(handle));
+            }
+        }
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);
@@ -1107,7 +1114,11 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_set_cursor(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+    fn handle_set_cursor(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        // A child window under the cursor (a web view) sets its own.
+        if wparam.0 != handle.0 as usize {
+            return None;
+        }
         if unsafe { !IsWindowEnabled(handle).as_bool() }
             || matches!(
                 lparam.loword() as u32,

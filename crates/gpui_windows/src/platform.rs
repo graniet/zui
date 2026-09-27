@@ -354,6 +354,11 @@ fn translate_accelerator(msg: &MSG) -> Option<()> {
     if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
         return None;
     }
+    // Any other window's procedure answers the custom message with 0,
+    // which would swallow its keys.
+    if !crate::window::is_gpui_window(msg.hwnd) {
+        return None;
+    }
 
     let result = unsafe {
         SendMessageW(

@@ -63,6 +63,10 @@ pub struct WindowsWindowState {
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<DirectXRenderer>,
+    /// Whether deferred content (a menu, a prompt, a drag) takes the input
+    /// over native child windows, and the children disabled meanwhile.
+    pub overlay_input: Cell<bool>,
+    pub overlay_disabled_children: RefCell<Vec<HWND>>,
     /// Set after a GPU device-lost recovery so the next `draw_window` call is
     /// treated as a forced render. This guarantees the next frame both
     /// re-enables drawing (via `mark_drawable`) and bypasses the GPUI view
@@ -168,6 +172,8 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
+            overlay_input: Cell::new(false),
+            overlay_disabled_children: RefCell::new(Vec::new()),
             force_render_after_recovery: Cell::new(false),
             click_state,
             current_cursor: Cell::new(current_cursor),
@@ -406,6 +412,41 @@ struct WindowCreateContext {
 }
 
 impl WindowsWindow {
+    /// While deferred content takes the input above native child windows (a
+    /// menu drawn over a web view), disable those children so clicks and keys
+    /// reach GPUI, as the macOS overlay view does. Composition planes take no
+    /// part in hit testing; Windows routes a disabled child's mouse input to
+    /// its parent.
+    fn set_overlay_input(&self, active: bool) {
+        if self.state.overlay_input.replace(active) == active {
+            return;
+        }
+        let hwnd = self.0.hwnd;
+        if active {
+            let mut disabled = Vec::new();
+            unsafe {
+                let mut child = GetWindow(hwnd, GW_CHILD).ok();
+                while let Some(window) = child {
+                    if IsWindowEnabled(window).as_bool() {
+                        let _ = EnableWindow(window, false);
+                        disabled.push(window);
+                    }
+                    child = GetWindow(window, GW_HWNDNEXT).ok();
+                }
+                if GetFocus() != hwnd {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+            *self.state.overlay_disabled_children.borrow_mut() = disabled;
+        } else {
+            for window in self.state.overlay_disabled_children.take() {
+                unsafe {
+                    let _ = EnableWindow(window, true);
+                }
+            }
+        }
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
@@ -982,6 +1023,33 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn draw_layered(&self, scene: &Scene, overlay_start: usize, capture_input: bool) {
+        let mut renderer = self.state.renderer.borrow_mut();
+        if !renderer.has_overlay() {
+            renderer
+                .draw(scene, self.state.background_appearance.get())
+                .log_err();
+            return;
+        }
+        let split = overlay_start.min(scene.len());
+        let mut base = Scene::default();
+        base.replay(0..split, scene);
+        base.finish();
+        let mut overlay = Scene::default();
+        overlay.replay(split..scene.len(), scene);
+        overlay.finish();
+        let visible = renderer
+            .draw_layered(&base, &overlay, self.state.background_appearance.get())
+            .log_err()
+            .unwrap_or(false);
+        drop(renderer);
+        self.set_overlay_input(capture_input && visible);
+    }
+
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.state.renderer.borrow_mut().enable_overlay()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }
@@ -1355,6 +1423,14 @@ enum WindowOpenState {
 }
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");
+
+/// Whether `hwnd` is one of GPUI's own windows, not a native child such as
+/// a web view's container, whose keys must not become GPUI keystrokes.
+pub(crate) fn is_gpui_window(hwnd: HWND) -> bool {
+    let mut name = [0u16; 32];
+    let len = unsafe { GetClassNameW(hwnd, &mut name) };
+    len > 0 && name[..len as usize] == *unsafe { WINDOW_CLASS_NAME.as_wide() }
+}
 
 fn register_window_class(icon_handle: HICON) {
     static ONCE: Once = Once::new();

@@ -49,6 +49,11 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    /// Deferred content (menus, prompts, drags) above native child windows,
+    /// once a window hosts one (a web view); the base scene stays below them.
+    overlay: Option<OverlayPlane>,
+    /// Asked for, so recreated after a device loss.
+    overlay_requested: bool,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -127,6 +132,21 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+/// The topmost composition target of a window. DirectComposition gives a
+/// window one target below its child windows and one above them: the base
+/// scene uses the lower one, so a native child (a web view) shows over it,
+/// and this plane carries what must stay above that child.
+struct OverlayPlane {
+    // Held for their lifetime: dropping them removes the plane.
+    _comp_target: IDCompositionTarget,
+    _comp_visual: IDCompositionVisual,
+    swap_chain: IDXGISwapChain1,
+    render_target: Option<ID3D11Texture2D>,
+    render_target_view: Option<ID3D11RenderTargetView>,
+    /// Whether its last presented frame may hold pixels.
+    shown: bool,
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -196,11 +216,126 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            overlay: None,
+            overlay_requested: false,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
             skip_draws: false,
         })
+    }
+
+    /// Whether deferred content draws on its own plane above child windows.
+    pub(crate) fn has_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Add the plane above child windows. Needs DirectComposition.
+    pub(crate) fn enable_overlay(&mut self) -> Result<()> {
+        self.overlay_requested = true;
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        let comp_device = self
+            .direct_composition
+            .as_ref()
+            .map(|composition| composition.comp_device.clone())
+            .context("Native child windows need DirectComposition")?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let swap_chain = create_swap_chain_for_composition(
+            &devices.dxgi_factory,
+            &devices.device,
+            self.width,
+            self.height,
+        )?;
+        let (render_target, render_target_view) =
+            create_render_target_and_its_view(&swap_chain, &devices.device)?;
+        let (comp_target, comp_visual) = unsafe {
+            let target = comp_device
+                .CreateTargetForHwnd(self.hwnd, true)
+                .context("Creating the overlay composition target")?;
+            let visual = comp_device.CreateVisual()?;
+            visual.SetContent(&swap_chain)?;
+            target.SetRoot(&visual)?;
+            (target, visual)
+        };
+        self.overlay = Some(OverlayPlane {
+            _comp_target: comp_target,
+            _comp_visual: comp_visual,
+            swap_chain,
+            render_target: Some(render_target),
+            render_target_view,
+            shown: true,
+        });
+        // An unpresented buffer is undefined: start transparent.
+        self.clear_overlay()?;
+        unsafe { comp_device.Commit() }.context("Committing the overlay plane")?;
+        Ok(())
+    }
+
+    /// Draw `base` below child windows and `overlay` above them. Returns
+    /// whether the overlay plane shows anything.
+    pub(crate) fn draw_layered(
+        &mut self,
+        base: &Scene,
+        overlay: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<bool> {
+        if self.skip_draws {
+            return Ok(false);
+        }
+        self.draw_scene(base, background_appearance)?;
+        self.present()?;
+        let Some(plane) = &self.overlay else {
+            return Ok(false);
+        };
+        if overlay.is_empty() {
+            if plane.shown {
+                self.clear_overlay()?;
+            }
+            return Ok(false);
+        }
+        self.with_overlay_target(|this| {
+            this.draw_scene(overlay, WindowBackgroundAppearance::Transparent)?;
+            this.present()
+        })?;
+        if let Some(plane) = &mut self.overlay {
+            plane.shown = true;
+        }
+        Ok(true)
+    }
+
+    fn clear_overlay(&mut self) -> Result<()> {
+        self.with_overlay_target(|this| {
+            this.pre_draw(&[0.0; 4])?;
+            this.present()
+        })?;
+        if let Some(plane) = &mut self.overlay {
+            plane.shown = false;
+        }
+        Ok(())
+    }
+
+    /// Run `draw` with the overlay plane as the render target: every drawing
+    /// path targets `resources`, so the plane's swap chain and views stand in
+    /// for the base ones meanwhile (same device, size and scratch textures).
+    fn with_overlay_target<T>(&mut self, draw: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.swap_overlay_target()?;
+        let result = draw(self);
+        self.swap_overlay_target()?;
+        result
+    }
+
+    fn swap_overlay_target(&mut self) -> Result<()> {
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let plane = self.overlay.as_mut().context("overlay missing")?;
+        std::mem::swap(&mut resources.swap_chain, &mut plane.swap_chain);
+        std::mem::swap(&mut resources.render_target, &mut plane.render_target);
+        std::mem::swap(
+            &mut resources.render_target_view,
+            &mut plane.render_target_view,
+        );
+        Ok(())
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -271,6 +406,7 @@ impl DirectXRenderer {
                     .log_err();
             }
 
+            self.overlay.take();
             self.resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
@@ -323,6 +459,11 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        if self.overlay_requested {
+            self.enable_overlay()
+                .context("Recreating the overlay plane")
+                .log_err();
+        }
         self.skip_draws = true;
         Ok(())
     }
@@ -469,6 +610,29 @@ impl DirectXRenderer {
             devices
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        }
+
+        if let Some(plane) = self.overlay.as_mut() {
+            plane.render_target.take();
+            plane.render_target_view.take();
+            unsafe {
+                plane
+                    .swap_chain
+                    .ResizeBuffers(
+                        BUFFER_COUNT as u32,
+                        width,
+                        height,
+                        RENDER_TARGET_FORMAT,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                    .context("Failed to resize the overlay swap chain")?;
+            }
+            let (render_target, render_target_view) =
+                create_render_target_and_its_view(&plane.swap_chain, &devices.device)?;
+            plane.render_target = Some(render_target);
+            plane.render_target_view = render_target_view;
+            // Resized buffers are undefined until the next frame clears them.
+            plane.shown = true;
         }
 
         Ok(())
@@ -974,7 +1138,10 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // Below child windows: a native child (a web view) shows over the
+        // scene, and `OverlayPlane` (topmost) over the child. Without child
+        // windows the result is the same as a topmost target.
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
@@ -1692,22 +1859,34 @@ pub(crate) mod shader_resources {
         Fragment,
     }
 
+    #[cfg(all(not(debug_assertions), gpui_runtime_shaders))]
+    use windows::{
+        Win32::Graphics::Direct3D::{
+            Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
+            ID3DBlob, ID3DInclude,
+        },
+        core::PCSTR,
+    };
+
     pub(crate) struct RawShaderBytes<'t> {
         inner: &'t [u8],
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, gpui_runtime_shaders))]
         _blob: ID3DBlob,
     }
 
     impl<'t> RawShaderBytes<'t> {
         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
-            #[cfg(not(debug_assertions))]
+            #[cfg(all(not(debug_assertions), not(gpui_runtime_shaders)))]
             {
                 Ok(Self::from_bytes(module, target))
             }
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, gpui_runtime_shaders))]
             {
+                #[cfg(debug_assertions)]
                 let blob = build_shader_blob(module, target)?;
+                #[cfg(not(debug_assertions))]
+                let blob = build_embedded_shader_blob(module, target)?;
                 let inner = unsafe {
                     std::slice::from_raw_parts(
                         blob.GetBufferPointer() as *const u8,
@@ -1722,7 +1901,7 @@ pub(crate) mod shader_resources {
             self.inner
         }
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(all(not(debug_assertions), not(gpui_runtime_shaders)))]
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
                 ShaderModule::BackdropPass => match target {
@@ -1840,10 +2019,65 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(not(debug_assertions))]
+    /// Release shaders of a cross build (no fxc on the build host): the
+    /// embedded HLSL, compiled once per module at startup with fxc's `/O3`.
+    #[cfg(all(not(debug_assertions), gpui_runtime_shaders))]
+    fn build_embedded_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+        const ALPHA_CORRECTION: &str = include_str!("alpha_correction.hlsl");
+        let source = if matches!(entry, ShaderModule::EmojiRasterization) {
+            include_str!("color_text_raster.hlsl")
+        } else {
+            include_str!("shaders.hlsl")
+        }
+        // In-memory compilation has no file include handler.
+        .replace("#include \"alpha_correction.hlsl\"", ALPHA_CORRECTION);
+        let entry_point = format!(
+            "{}_{}\0",
+            entry.as_str(),
+            match target {
+                ShaderTarget::Vertex => "vertex",
+                ShaderTarget::Fragment => "fragment",
+            }
+        );
+        let profile = match target {
+            ShaderTarget::Vertex => "vs_4_1\0",
+            ShaderTarget::Fragment => "ps_4_1\0",
+        };
+        let mut code = None;
+        let mut errors = None;
+        let result = unsafe {
+            D3DCompile(
+                source.as_ptr() as *const _,
+                source.len(),
+                PCSTR::null(),
+                None,
+                None::<&ID3DInclude>,
+                PCSTR::from_raw(entry_point.as_ptr()),
+                PCSTR::from_raw(profile.as_ptr()),
+                D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(error) = result {
+            let detail = errors
+                .map(|blob| unsafe {
+                    std::ffi::CStr::from_ptr(blob.GetBufferPointer() as *const i8)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| format!("{error:?}"));
+            log::error!("Shader compile error: {detail}");
+            return Err(anyhow::anyhow!("Compile error: {detail}"));
+        }
+        code.ok_or_else(|| anyhow::anyhow!("D3DCompile returned no code"))
+    }
+
+    #[cfg(all(not(debug_assertions), not(gpui_runtime_shaders)))]
     include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, gpui_runtime_shaders))]
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
