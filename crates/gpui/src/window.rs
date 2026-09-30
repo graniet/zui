@@ -1705,7 +1705,13 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _cx| {
                         for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
+                            // Only an area the pointer actually hovers: a hitbox that
+                            // blocks the mouse for what is behind it (`occlude`, and
+                            // `block_mouse_except_scroll`, which still lets scroll
+                            // through) keeps the area behind it out as well. On Windows
+                            // the area answers WM_NCHITTEST, and a caption there would
+                            // take the click and the drag from the element on top.
+                            if hitbox.id.hit_test(window) {
                                 return Some(*area);
                             }
                         }
@@ -6973,6 +6979,67 @@ mod tests {
             "resize must wake a parked window"
         );
         assert!(!platform.simulate_display_tick());
+    }
+
+    /// A titlebar strip that drags the window, with a tab that blocks the
+    /// mouse but lets scroll through, a button that blocks it all, and a
+    /// label that only sets a cursor.
+    struct CaptionStrip;
+
+    impl Render for CaptionStrip {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("caption")
+                .size_full()
+                .flex()
+                .flex_row()
+                .window_control_area(crate::WindowControlArea::Drag)
+                .child(
+                    div()
+                        .id("tab")
+                        .w(px(100.))
+                        .h(px(40.))
+                        .block_mouse_except_scroll(),
+                )
+                .child(div().id("button").w(px(100.)).h(px(40.)).occlude())
+                .child(div().id("label").w(px(100.)).h(px(40.)).cursor_pointer())
+        }
+    }
+
+    #[test]
+    fn window_control_area_yields_to_elements_that_block_the_mouse() {
+        let mut cx = TestAppContext::single();
+        let handle = cx.add_window(|_, _| CaptionStrip);
+        let mut platform = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.platform_window.as_test().unwrap().clone()
+            })
+            .unwrap();
+        let mut area_at = |x: f32, y: f32| {
+            platform.simulate_input(crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                position: crate::point(px(x), px(y)),
+                pressed_button: None,
+                modifiers: crate::Modifiers::default(),
+            }));
+            platform.simulate_hit_test_window_control()
+        };
+        assert_eq!(
+            area_at(50., 20.),
+            None,
+            "a tab that blocks the mouse keeps the caption from taking its click and drag"
+        );
+        assert_eq!(area_at(150., 20.), None, "an occluding button too");
+        assert_eq!(
+            area_at(250., 20.),
+            Some(crate::WindowControlArea::Drag),
+            "an element that lets the mouse through leaves the strip draggable"
+        );
+        assert_eq!(
+            area_at(400., 20.),
+            Some(crate::WindowControlArea::Drag),
+            "the strip itself drags the window"
+        );
     }
 
     struct NativeFrameProbe {

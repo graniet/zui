@@ -133,6 +133,17 @@ impl TestWindow {
         self.0.lock().active_status_change_callback = Some(callback);
     }
 
+    /// Ask the window which control area the pointer is over, as a platform
+    /// hit test (Windows' WM_NCHITTEST) does.
+    pub fn simulate_hit_test_window_control(&mut self) -> Option<WindowControlArea> {
+        let mut lock = self.0.lock();
+        let mut callback = lock.hit_test_window_control_callback.take()?;
+        drop(lock);
+        let area = callback();
+        self.0.lock().hit_test_window_control_callback = Some(callback);
+        area
+    }
+
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.input_callback.take() else {
