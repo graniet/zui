@@ -4229,6 +4229,64 @@ mod tests {
         assert_eq!(stateful_width.get(), px(10.));
     }
 
+    struct DragThresholdView;
+
+    impl Render for DragThresholdView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("draggable")
+                    .size(px(100.))
+                    .on_drag((), |_, _, _, cx| cx.new(|_| TestTooltipView)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_press_becomes_a_drag_past_the_platform_threshold(cx: &mut TestAppContext) {
+        let window = AnyWindowHandle::from(cx.add_window(|_, _| DragThresholdView));
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::MouseDown(crate::MouseDownEvent {
+                    button: crate::MouseButton::Left,
+                    position: point(px(50.), px(50.)),
+                    modifiers: crate::Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        let drags_after = |cx: &mut TestAppContext, travel: f32| {
+            cx.update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    crate::PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(50. + travel), px(50.)),
+                        pressed_button: Some(crate::MouseButton::Left),
+                        modifiers: crate::Modifiers::default(),
+                    }),
+                    cx,
+                );
+                cx.has_active_drag()
+            })
+            .unwrap()
+        };
+        assert!(!drags_after(cx, 1.), "a pixel of travel is still a click");
+        let jitter = drags_after(cx, 3.);
+        if cfg!(target_os = "windows") {
+            assert!(
+                !jitter,
+                "Windows keeps a 3px jitter a click, as its own drag rectangle does"
+            );
+            assert!(drags_after(cx, 5.), "past the rectangle, a drag");
+        } else {
+            assert!(jitter, "elsewhere 3px of travel is a drag");
+        }
+    }
+
     struct TestTooltipView;
 
     impl Render for TestTooltipView {
